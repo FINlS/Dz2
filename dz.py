@@ -1,225 +1,104 @@
+import math
 import random
-import select
 import socket
 import struct
-import sys
-
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 53
-ROOTS = [
-    "198.41.0.4",
-    "170.247.170.2",
-    "192.33.4.12",
-    "199.7.91.13",
-    "192.203.230.10",
-    "192.5.5.241",
-    "192.112.36.4",
-    "198.97.190.53",
-    "192.36.148.17",
-    "192.58.128.30",
-    "193.0.14.129",
-    "199.7.83.42",
-    "202.12.27.33",
-]
+import threading
 
 
-def encode_name(name):
-    result = b""
-    for label in name.split("."):
-        if label:
-            result += bytes([len(label)]) + label.encode("latin-1")
-    return result + b"\x00"
+def pack_name(name):
+    return b"".join(bytes([len(p)]) + p.encode() for p in name.split(".") if p) + b"\0"
 
 
-def parse_name(data, offset):
-    labels = []
-    end = 0
-    jumped = False
-    jumps = 0
-    while True:
-        length = data[offset]
-        if length & 0xC0 == 0xC0:
-            jumps += 1
-            if jumps > 20:
-                raise ValueError("loop")
-            if not jumped:
-                end = offset + 2
-            jumped = True
-            offset = ((length & 0x3F) << 8) | data[offset + 1]
-        elif length == 0:
-            if not jumped:
-                end = offset + 1
-            break
+def read_name(m, o):
+    parts, end = [], None
+    while m[o]:
+        if m[o] & 0xC0 == 0xC0:
+            end = end or o + 2
+            o = struct.unpack("!H", m[o:o + 2])[0] & 0x3FFF
         else:
-            labels.append(data[offset + 1:offset + 1 + length].decode("latin-1"))
-            offset += 1 + length
-    return ".".join(labels), end
+            parts.append(m[o + 1:o + 1 + m[o]].decode())
+            o += m[o] + 1
+    return ".".join(parts), end or o + 1
 
 
-def read_record(data, offset):
-    name, offset = parse_name(data, offset)
-    rtype, rclass, ttl, length = struct.unpack("!HHIH", data[offset:offset + 10])
-    offset += 10
-    value = None
-    if rtype == 1:
-        value = socket.inet_ntoa(data[offset:offset + 4])
-    elif rtype in (2, 5):
-        value, _ = parse_name(data, offset)
-    return (name, rtype, ttl, value), offset + length
+def read_records(m, o, n):
+    out = []
+    for _ in range(n):
+        name, o = read_name(m, o)
+        t, _, ttl, ln = struct.unpack("!HHIH", m[o:o + 10])
+        o += 10
+        rd = m[o:o + ln]
+        if t in (2, 5):
+            rd = pack_name(read_name(m, o)[0])
+        out.append((name, t, ttl, rd))
+        o += ln
+    return out, o
 
 
-def parse_response(data):
-    qid, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", data[:12])
-    offset = 12
-    for _ in range(qd):
-        _, offset = parse_name(data, offset)
-        offset += 4
-    sections = []
-    for count in (an, ns, ar):
-        records = []
-        for _ in range(count):
-            record, offset = read_record(data, offset)
-            records.append(record)
-        sections.append(records)
-    return flags & 15, sections[0], sections[1], sections[2]
+def multiply(name):
+    parts = name.split(".")
+    if "multiply" in parts:
+        nums = parts[:parts.index("multiply")]
+        if nums and all(n.isdigit() for n in nums):
+            return "127.0.0.%d" % (math.prod(map(int, nums)) % 256)
 
 
-def recv_exact(sock, count):
-    data = b""
-    while len(data) < count:
-        part = sock.recv(count - len(data))
-        if not part:
-            raise ConnectionError
-        data += part
-    return data
+def resolve(name):
+    ip = multiply(name)
+    if ip:
+        return [(name, 1, 60, socket.inet_aton(ip))]
 
-
-def ask(ip, name):
-    packet = struct.pack("!HHHHHH", random.randint(0, 65535), 0, 1, 0, 0, 0)
-    packet += encode_name(name) + struct.pack("!HH", 1, 1)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.settimeout(3)
-        s.sendto(packet, (ip, 53))
-        data, _ = s.recvfrom(4096)
-    if data[:2] != packet[:2]:
-        raise ValueError("wrong id")
-    flags = struct.unpack("!H", data[2:4])[0]
-    if flags & 0x0200:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(3)
-            s.connect((ip, 53))
-            s.sendall(struct.pack("!H", len(packet)) + packet)
-            length = struct.unpack("!H", recv_exact(s, 2))[0]
-            data = recv_exact(s, length)
-    return data
-
-
-def resolve(name, depth=0):
-    if depth > 8:
-        return 2, []
-    servers = list(ROOTS)
+    server = "198.41.0.4"
     for _ in range(15):
-        response = None
-        for ip in servers:
+        query = (struct.pack("!HHHHHH", random.randrange(65536), 0, 1, 0, 0, 0)
+                 + pack_name(name) + struct.pack("!HH", 1, 1))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(2)
             try:
-                response = parse_response(ask(ip, name))
-                break
-            except Exception:
-                continue
-        if response is None:
-            return 2, []
-        rcode, answers, authority, additional = response
-        if rcode != 0:
-            return rcode, []
+                s.sendto(query, (server, 53))
+                data, _ = s.recvfrom(4096)
+            except OSError:
+                return []
+
+        an, ns, ar = struct.unpack("!HHH", data[6:12])
+        o = read_name(data, 12)[1] + 4
+        answers, o = read_records(data, o, an)
+        auth, o = read_records(data, o, ns)
+        extra, _ = read_records(data, o, ar)
+
         if answers:
-            last = answers[-1]
-            if last[1] == 5 and not any(r[1] == 1 for r in answers):
-                rcode, more = resolve(last[3], depth + 1)
-                return rcode, answers + more
-            return 0, answers
-        ns_names = [r[3].lower() for r in authority if r[1] == 2]
+            if answers[-1][1] == 5:
+                return answers + resolve(read_name(answers[-1][3], 0)[0])
+            return answers
+
+        ns_names = [read_name(r[3], 0)[0].lower() for r in auth if r[1] == 2]
         if not ns_names:
-            return 0, []
-        ips = [r[3] for r in additional if r[1] == 1 and r[0].lower() in ns_names]
-        if not ips:
-            for ns_name in ns_names:
-                rcode, found = resolve(ns_name, depth + 1)
-                ips = [r[3] for r in found if r[1] == 1]
-                if ips:
-                    break
-        if not ips:
-            return 2, []
-        servers = ips
-    return 2, []
+            return []
+        glue = [socket.inet_ntoa(r[3]) for r in extra if r[1] == 1 and r[0].lower() in ns_names]
+        glue = glue or [socket.inet_ntoa(r[3]) for r in resolve(ns_names[0]) if r[1] == 1]
+        if not glue:
+            return []
+        server = glue[0]
+    return []
 
 
-def get_answers(name):
-    lower = name.lower()
-    if ".multiply." in lower:
-        try:
-            product = 1
-            for number in lower.split(".multiply.")[0].split("."):
-                product *= int(number)
-            return 0, [(name, 1, 60, "127.0.0.%d" % (product % 256))]
-        except ValueError:
-            pass
-    return resolve(name)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("127.0.0.1", 5354))
 
 
-def handle(data, udp):
-    qid, flags = struct.unpack("!HH", data[:4])
-    name, offset = parse_name(data, 12)
-    qtype, qclass = struct.unpack("!HH", data[offset:offset + 4])
-    question = data[12:offset + 4]
-    if qtype == 1:
-        rcode, answers = get_answers(name)
-    else:
-        rcode, answers = 0, []
-    body = b""
-    count = 0
-    for rname, rtype, ttl, value in answers:
-        if rtype == 1:
-            rdata = socket.inet_aton(value)
-        elif rtype == 5:
-            rdata = encode_name(value)
-        else:
-            continue
-        body += encode_name(rname) + struct.pack("!HHIH", rtype, 1, ttl, len(rdata)) + rdata
-        count += 1
-    head_flags = 0x8000 | (flags & 0x0100) | 0x0080 | rcode
-    response = struct.pack("!HHHHHH", qid, head_flags, 1, count, 0, 0) + question + body
-    if udp and len(response) > 512:
-        response = struct.pack("!HHHHHH", qid, head_flags | 0x0200, 1, 0, 0, 0) + question
-    return response
-
-
-def answer_tcp(conn):
-    conn.settimeout(5)
+def handle(data, addr):
     try:
-        length = struct.unpack("!H", recv_exact(conn, 2))[0]
-        data = recv_exact(conn, length)
-        response = handle(data, False)
-        conn.sendall(struct.pack("!H", len(response)) + response)
+        name, o = read_name(data, 12)
+        qtype = struct.unpack("!H", data[o:o + 2])[0]
+        answers = resolve(name.lower()) if qtype == 1 else []
+        resp = data[:2] + struct.pack("!HHHHH", 0x8180, 1, len(answers), 0, 0) + data[12:o + 4]
+        for n, t, ttl, rd in answers:
+            resp += pack_name(n) + struct.pack("!HHIH", t, 1, ttl, len(rd)) + rd
+        sock.sendto(resp, addr)
     except Exception:
         pass
-    conn.close()
 
-
-udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp_sock.bind(("0.0.0.0", PORT))
-tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-tcp_sock.bind(("0.0.0.0", PORT))
-tcp_sock.listen()
 
 while True:
-    ready, _, _ = select.select([udp_sock, tcp_sock], [], [])
-    for sock in ready:
-        if sock is udp_sock:
-            data, addr = udp_sock.recvfrom(4096)
-            try:
-                udp_sock.sendto(handle(data, True), addr)
-            except Exception:
-                pass
-        else:
-            conn, _ = tcp_sock.accept()
-            answer_tcp(conn)
+    data, addr = sock.recvfrom(512)
+    threading.Thread(target=handle, args=(data, addr), daemon=True).start()
